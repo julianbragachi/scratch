@@ -115,7 +115,7 @@ function AppContent() {
           result = await aiService.executeCodexEdit(currentNote.path, prompt);
         } else if (aiProvider === "ollama") {
           const settings = await getSettings();
-          const model = settings?.ollamaModel || "llama3.2";
+          const model = settings?.ollamaModel || "qwen3";
           result = await aiService.executeOllamaEdit(
             currentNote.path,
             prompt,
@@ -433,6 +433,7 @@ function AppContent() {
         onBack={handleBackToPalette}
         onExecute={handleAiEdit}
         isExecuting={aiEditing}
+        onOpenSettings={toggleSettings}
       />
 
       {/* AI Editing Overlay */}

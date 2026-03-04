@@ -2517,9 +2517,9 @@ async fn ai_execute_ollama(
          User instructions:\n{prompt}"
     );
 
-    // Use the model provided (frontend reads from settings, defaults to "llama3.2")
+    // Use the model provided (frontend reads from settings, defaults to "qwen3")
     let model_name = if model.is_empty() {
-        "llama3.2".to_string()
+        "qwen3".to_string()
     } else {
         model
     };

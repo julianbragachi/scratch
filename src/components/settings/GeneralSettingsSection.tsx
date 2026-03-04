@@ -63,7 +63,7 @@ export function GeneralSettingsSection() {
   const [showRemoteInput, setShowRemoteInput] = useState(false);
   const [noteTemplate, setNoteTemplate] = useState<string>("Untitled");
   const [previewNoteName, setPreviewNoteName] = useState<string>("Untitled");
-  const [ollamaModel, setOllamaModel] = useState<string>("llama3.2");
+  const [ollamaModel, setOllamaModel] = useState<string>("qwen3");
 
   // Load template from settings on mount
   useEffect(() => {
@@ -72,7 +72,7 @@ export function GeneralSettingsSection() {
         const settings = await invoke<Settings>("get_settings");
         const template = settings.defaultNoteName || "Untitled";
         setNoteTemplate(template);
-        setOllamaModel(settings.ollamaModel || "llama3.2");
+        setOllamaModel(settings.ollamaModel || "qwen3");
 
         // Update preview
         const preview = await invoke<string>("preview_note_name", { template });
@@ -581,12 +581,12 @@ export function GeneralSettingsSection() {
             value={ollamaModel}
             onChange={(e) => setOllamaModel(e.target.value)}
             onBlur={handleSaveOllamaModel}
-            placeholder="llama3.2"
+            placeholder="qwen3"
           />
           <p className="text-xs text-text-muted">
             Make sure this model is installed locally via{" "}
             <code className="bg-bg-muted px-1 py-0.5 rounded text-2xs">
-              ollama pull {ollamaModel || "llama3.2"}
+              ollama pull {ollamaModel || "qwen3"}
             </code>
           </p>
         </div>

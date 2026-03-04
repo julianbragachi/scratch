@@ -1,7 +1,9 @@
 import { useState, useRef, useEffect, type KeyboardEvent } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { SpinnerIcon, ClaudeIcon, CodexIcon, OllamaIcon } from "../icons";
 import * as aiService from "../../services/ai";
 import type { AiProvider } from "../../services/ai";
+import type { Settings } from "../../types/note";
 
 interface AiEditModalProps {
   open: boolean;
@@ -9,6 +11,7 @@ interface AiEditModalProps {
   onBack: () => void; // Go back to command palette
   onExecute: (prompt: string) => Promise<void>;
   isExecuting: boolean;
+  onOpenSettings?: () => void;
 }
 
 export function AiEditModal({
@@ -17,9 +20,11 @@ export function AiEditModal({
   onBack,
   onExecute,
   isExecuting,
+  onOpenSettings,
 }: AiEditModalProps) {
   const [prompt, setPrompt] = useState("");
   const [cliInstalled, setCliInstalled] = useState<boolean | null>(null);
+  const [ollamaModel, setOllamaModel] = useState<string>("qwen3");
   const inputRef = useRef<HTMLInputElement>(null);
   const ProviderIcon =
     provider === "codex"
@@ -72,6 +77,14 @@ export function AiEditModal({
       active = false;
     };
   }, [open, provider, cliName]);
+
+  // Load Ollama model from settings when modal opens
+  useEffect(() => {
+    if (!open || provider !== "ollama") return;
+    invoke<Settings>("get_settings")
+      .then((settings) => setOllamaModel(settings.ollamaModel || "qwen3"))
+      .catch(() => {});
+  }, [open, provider]);
 
   // Clear prompt when modal closes
   useEffect(() => {
@@ -192,6 +205,27 @@ export function AiEditModal({
                   local {cliName}. You'll be able to undo changes.
                 </span>
               </div>
+              {provider === "ollama" && (
+                <div className="text-sm p-3 bg-bg-muted rounded-md flex items-center justify-between">
+                  <span className="text-text-muted">
+                    Using model{" "}
+                    <code className="text-text font-medium bg-bg-secondary px-1.5 py-0.5 rounded text-xs">
+                      {ollamaModel}
+                    </code>
+                  </span>
+                  {onOpenSettings && (
+                    <button
+                      onClick={() => {
+                        onBack();
+                        onOpenSettings();
+                      }}
+                      className="text-xs text-text-muted hover:text-text transition-colors cursor-pointer underline underline-offset-2"
+                    >
+                      Change model
+                    </button>
+                  )}
+                </div>
+              )}
               <div className="w-full flex justify-between">
                 <div className="flex items-center gap-1.5 text-sm text-text-muted">
                   <kbd className="text-xs px-1.5 py-0.5 rounded-md bg-bg-muted text-text-muted">
