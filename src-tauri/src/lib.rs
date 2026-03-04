@@ -2349,7 +2349,7 @@ async fn execute_ai_cli(
 
         // Strip ANSI escape sequences from output (e.g. Ollama progress spinners)
         let ansi_re = regex::Regex::new(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\].*?\x07").unwrap();
-        let stdout_clean = ansi_re.replace_all(&stdout_str, "").trim().to_string();
+        let stdout_clean = ansi_re.replace_all(&stdout_str, "").to_string();
         let stderr_clean = ansi_re.replace_all(&stderr_str, "").trim().to_string();
 
         if success {
@@ -2576,7 +2576,8 @@ async fn ai_execute_ollama(
             let err_lower = err.to_lowercase();
             if err_lower.contains("file does not exist")
                 || err_lower.contains("pull model manifest")
-                || err_lower.contains("not found")
+                || err_lower.contains("model not found")
+                || err_lower.contains("model does not exist")
             {
                 return Ok(AiExecutionResult {
                     success: false,
