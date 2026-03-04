@@ -417,6 +417,23 @@ export function InlineCodeIcon({ className = "w-4.5 h-4.5" }: IconProps) {
   );
 }
 
+
+export function BlockMathIcon({ className = "w-4.5 h-4.5" }: IconProps) {
+  return (
+    <svg
+      className={className}
+      fill="none"
+      stroke="currentColor"
+      viewBox="0 0 24 24"
+      strokeWidth={2}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <path d="M18 7V5a1 1 0 0 0-1-1H6.5a.5.5 0 0 0-.4.8l4.5 6a2 2 0 0 1 0 2.4l-4.5 6a.5.5 0 0 0 .4.8H17a1 1 0 0 0 1-1v-2" />
+    </svg>
+  );
+}
+
 export function SeparatorIcon({ className = "w-4.5 h-4.5" }: IconProps) {
   return (
     <svg
@@ -627,6 +644,25 @@ export function FolderIcon({ className = "w-4.5 h-4.5" }: IconProps) {
     >
       <path stroke="none" d="M0 0h24v24H0z" fill="none" />
       <path d="M5 19l2.757 -7.351a1 1 0 0 1 .936 -.649h12.307a1 1 0 0 1 .986 1.164l-.996 5.211a2 2 0 0 1 -1.964 1.625h-14.026a2 2 0 0 1 -2 -2v-11a2 2 0 0 1 2 -2h4l3 3h7a2 2 0 0 1 2 2v2" />
+    </svg>
+  );
+}
+
+export function FolderPlusIcon({ className = "w-4.5 h-4.5" }: IconProps) {
+  return (
+    <svg
+      className={className}
+      fill="none"
+      stroke="currentColor"
+      viewBox="0 0 24 24"
+      strokeWidth={2}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <path stroke="none" d="M0 0h24v24H0z" fill="none" />
+      <path d="M12 19h-7a2 2 0 0 1 -2 -2v-11a2 2 0 0 1 2 -2h4l3 3h7a2 2 0 0 1 2 2v3.5" />
+      <path d="M16 19h6" />
+      <path d="M19 16v6" />
     </svg>
   );
 }

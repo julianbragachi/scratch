@@ -19,7 +19,12 @@ import { lowlight } from "./lowlight";
 import { CodeBlockView } from "./CodeBlockView";
 import { Extension } from "@tiptap/core";
 import { Decoration, DecorationSet } from "@tiptap/pm/view";
-import { Plugin, PluginKey } from "@tiptap/pm/state";
+import {
+  NodeSelection,
+  Plugin,
+  PluginKey,
+  TextSelection,
+} from "@tiptap/pm/state";
 import tippy, { type Instance as TippyInstance } from "tippy.js";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -42,11 +47,14 @@ import { Menu, MenuItem, PredefinedMenuItem } from "@tauri-apps/api/menu";
 import { useOptionalNotes } from "../../context/NotesContext";
 import { useTheme } from "../../context/ThemeContext";
 import { Frontmatter } from "./Frontmatter";
+import { BlockMathEditor } from "./BlockMathEditor";
 import { LinkEditor } from "./LinkEditor";
 import { SearchToolbar } from "./SearchToolbar";
 import { SlashCommand } from "./SlashCommand";
 import { Wikilink, type WikilinkStorage } from "./Wikilink";
 import { WikilinkSuggestion } from "./WikilinkSuggestion";
+import { EditorWidthHandles } from "./EditorWidthHandle";
+import { ScratchBlockMath, normalizeBlockMath } from "./MathExtensions";
 import { cn } from "../../lib/utils";
 import { plainTextFromMarkdown } from "../../lib/plainText";
 import { Button, IconButton, ToolbarButton, Tooltip } from "../ui";
@@ -67,6 +75,7 @@ import {
   QuoteIcon,
   CodeIcon,
   InlineCodeIcon,
+  BlockMathIcon,
   SeparatorIcon,
   LinkIcon,
   BracketsIcon,
@@ -83,6 +92,7 @@ import {
   SearchIcon,
   MarkdownIcon,
   MarkdownOffIcon,
+  FolderPlusIcon,
 } from "../icons";
 
 function formatDateTime(timestamp: number): string {
@@ -96,6 +106,15 @@ function formatDateTime(timestamp: number): string {
     minute: "2-digit",
   });
 }
+
+// Standard number-field shortcuts for KaTeX (shared between inline and block math)
+const katexMacros: Record<string, string> = {
+  "\\R": "\\mathbb{R}",
+  "\\N": "\\mathbb{N}",
+  "\\Z": "\\mathbb{Z}",
+  "\\Q": "\\mathbb{Q}",
+  "\\C": "\\mathbb{C}",
+};
 
 // Search highlight extension - adds yellow backgrounds to search matches
 const searchHighlightPluginKey = new PluginKey("searchHighlight");
@@ -185,12 +204,18 @@ function GridPicker({ onSelect }: GridPickerProps) {
 interface FormatBarProps {
   editor: TiptapEditor | null;
   onAddLink: () => void;
+  onAddBlockMath: () => void;
   onAddImage: () => void;
 }
 
 // FormatBar must re-render with parent to reflect editor.isActive() state changes
 // (editor instance is mutable, so memo would cause stale active states)
-function FormatBar({ editor, onAddLink, onAddImage }: FormatBarProps) {
+function FormatBar({
+  editor,
+  onAddLink,
+  onAddBlockMath,
+  onAddImage,
+}: FormatBarProps) {
   const [tableMenuOpen, setTableMenuOpen] = useState(false);
 
   if (!editor) return null;
@@ -295,6 +320,13 @@ function FormatBar({ editor, onAddLink, onAddImage }: FormatBarProps) {
         <CodeIcon className="w-4.5 h-4.5 stroke-[1.5]" />
       </ToolbarButton>
       <ToolbarButton
+        onClick={onAddBlockMath}
+        isActive={editor.isActive("blockMath")}
+        title="Block Math"
+      >
+        <BlockMathIcon className="w-4.5 h-4.5 stroke-[1.5]" />
+      </ToolbarButton>
+      <ToolbarButton
         onClick={() => editor.chain().focus().setHorizontalRule().run()}
         isActive={false}
         title="Horizontal Rule"
@@ -373,6 +405,8 @@ interface EditorProps {
   focusMode?: boolean;
   previewMode?: PreviewModeData;
   onEditorReady?: (editor: TiptapEditor | null) => void;
+  onSaveToFolder?: () => void;
+  saveToFolderDisabled?: boolean;
 }
 
 export function Editor({
@@ -381,6 +415,8 @@ export function Editor({
   focusMode,
   onEditorReady,
   previewMode,
+  onSaveToFolder,
+  saveToFolderDisabled,
 }: EditorProps) {
   // Always call the hook (rules of hooks), but it returns null outside NotesProvider
   const notesCtx = useOptionalNotes();
@@ -395,7 +431,7 @@ export function Editor({
           modified: previewMode.modified,
         }
       : null
-    : notesCtx?.currentNote ?? null;
+    : (notesCtx?.currentNote ?? null);
 
   const saveNote = previewMode
     ? async (content: string, _noteId?: string) => {
@@ -444,6 +480,7 @@ export function Editor({
   const searchInputRef = useRef<HTMLInputElement>(null);
   const saveTimeoutRef = useRef<number | null>(null);
   const linkPopupRef = useRef<TippyInstance | null>(null);
+  const blockMathPopupRef = useRef<TippyInstance | null>(null);
   const isLoadingRef = useRef(false);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const editorRef = useRef<TiptapEditor | null>(null);
@@ -641,6 +678,263 @@ export function Editor({
     }, 500);
   }, [saveImmediately, getMarkdown, currentNote?.id]);
 
+  const closeBlockMathPopup = useCallback(() => {
+    if (blockMathPopupRef.current) {
+      blockMathPopupRef.current.destroy();
+      blockMathPopupRef.current = null;
+    }
+  }, []);
+
+  const handleEditBlockMath = useCallback(
+    (pos: number) => {
+      const currentEditor = editorRef.current;
+      if (!currentEditor) return;
+
+      if (linkPopupRef.current) {
+        linkPopupRef.current.destroy();
+        linkPopupRef.current = null;
+      }
+      closeBlockMathPopup();
+
+      const node = currentEditor.state.doc.nodeAt(pos);
+      if (!node || node.type.name !== "blockMath") {
+        return;
+      }
+
+      const virtualElement = {
+        getBoundingClientRect: () => {
+          const nodeDom = currentEditor.view.nodeDOM(pos);
+          if (nodeDom instanceof HTMLElement) {
+            return nodeDom.getBoundingClientRect();
+          }
+
+          const start = currentEditor.view.coordsAtPos(pos);
+          const end = currentEditor.view.coordsAtPos(pos + node.nodeSize);
+          const left = Math.min(start.left, end.left);
+          const top = Math.min(start.top, end.top);
+          const right = Math.max(start.right, end.right);
+          const bottom = Math.max(start.bottom, end.bottom);
+
+          return {
+            width: Math.max(2, right - left),
+            height: Math.max(20, bottom - top),
+            top,
+            left,
+            right,
+            bottom,
+            x: left,
+            y: top,
+            toJSON: () => ({}),
+          } as DOMRect;
+        },
+      };
+
+      const component = new ReactRenderer(BlockMathEditor, {
+        props: {
+          initialLatex: String(node.attrs.latex ?? ""),
+          onSubmit: (latex: string) => {
+            const trimmed = latex.trim();
+            if (!trimmed) {
+              toast.error("Please enter a formula.");
+              return;
+            }
+            currentEditor
+              .chain()
+              .focus()
+              .updateBlockMath({ pos, latex: trimmed })
+              .run();
+            closeBlockMathPopup();
+          },
+          onCancel: () => {
+            currentEditor.commands.focus();
+            closeBlockMathPopup();
+          },
+        },
+        editor: currentEditor,
+      });
+
+      blockMathPopupRef.current = tippy(document.body, {
+        getReferenceClientRect: () =>
+          virtualElement.getBoundingClientRect() as DOMRect,
+        appendTo: () => document.body,
+        content: component.element,
+        showOnCreate: true,
+        interactive: true,
+        trigger: "manual",
+        placement: "bottom-start",
+        offset: [0, 8],
+        onDestroy: () => {
+          component.destroy();
+        },
+      });
+    },
+    [closeBlockMathPopup],
+  );
+
+  const handleAddBlockMath = useCallback(() => {
+    const currentEditor = editorRef.current;
+    if (!currentEditor) return;
+
+    closeBlockMathPopup();
+    if (linkPopupRef.current) {
+      linkPopupRef.current.destroy();
+      linkPopupRef.current = null;
+    }
+    const { selection, doc } = currentEditor.state;
+    const { from, to, empty, $from } = selection;
+
+    if (
+      selection instanceof NodeSelection &&
+      selection.node.type.name === "blockMath"
+    ) {
+      handleEditBlockMath(from);
+      return;
+    }
+
+    if (!empty) {
+      const selectedNode = doc.nodeAt(from);
+      if (
+        selectedNode?.type.name === "blockMath" &&
+        from + selectedNode.nodeSize === to
+      ) {
+        handleEditBlockMath(from);
+        return;
+      }
+    }
+
+    if (empty) {
+      const nodeBefore = $from.nodeBefore;
+      if (nodeBefore?.type.name === "blockMath") {
+        handleEditBlockMath(from - nodeBefore.nodeSize);
+        return;
+      }
+      const nodeAfter = $from.nodeAfter;
+      if (nodeAfter?.type.name === "blockMath") {
+        handleEditBlockMath(from);
+        return;
+      }
+    }
+
+    const selectedText = empty ? "" : doc.textBetween(from, to, "\n");
+    const initialLatex = normalizeBlockMath(selectedText);
+    const targetRange = { from, to };
+    const hasSelection = from !== to;
+
+    const virtualElement = {
+      getBoundingClientRect: () => {
+        if (hasSelection) {
+          const startPos = currentEditor.view.domAtPos(from);
+          const endPos = currentEditor.view.domAtPos(to);
+
+          if (startPos && endPos) {
+            try {
+              const range = document.createRange();
+              range.setStart(startPos.node, startPos.offset);
+              range.setEnd(endPos.node, endPos.offset);
+              return range.getBoundingClientRect();
+            } catch (error) {
+              console.error("Block math range creation failed:", error);
+            }
+          }
+        }
+
+        const coords = currentEditor.view.coordsAtPos(from);
+        return {
+          width: 2,
+          height: 20,
+          top: coords.top,
+          left: coords.left,
+          right: coords.right,
+          bottom: coords.bottom,
+          x: coords.left,
+          y: coords.top,
+          toJSON: () => ({}),
+        } as DOMRect;
+      },
+    };
+
+    const component = new ReactRenderer(BlockMathEditor, {
+      props: {
+        initialLatex,
+        onSubmit: (latex: string) => {
+          const normalizedLatex = latex.trim();
+          if (!normalizedLatex) {
+            toast.error("Please enter a formula.");
+            return;
+          }
+
+          const inserted = currentEditor
+            .chain()
+            .focus()
+            .insertContentAt(targetRange, {
+              type: "blockMath",
+              attrs: { latex: normalizedLatex },
+            })
+            .command(({ state, tr, dispatch }) => {
+              if (!dispatch) return true;
+
+              const { $to } = tr.selection;
+              if ($to.nodeAfter?.isTextblock) {
+                tr.setSelection(TextSelection.create(tr.doc, $to.pos + 1));
+                tr.scrollIntoView();
+                return true;
+              }
+
+              const paragraphType =
+                state.schema.nodes.paragraph ??
+                $to.parent.type.contentMatch.defaultType;
+              const paragraphNode = paragraphType?.create();
+              const insertPos = $to.nodeAfter ? $to.pos : $to.end();
+
+              if (paragraphNode) {
+                const $insertPos = tr.doc.resolve(insertPos);
+                if (
+                  $insertPos.parent.canReplaceWith(
+                    $insertPos.index(),
+                    $insertPos.index(),
+                    paragraphNode.type,
+                  )
+                ) {
+                  tr.insert(insertPos, paragraphNode);
+                  tr.setSelection(TextSelection.create(tr.doc, insertPos + 1));
+                  tr.scrollIntoView();
+                  return true;
+                }
+              }
+
+              tr.scrollIntoView();
+              return true;
+            })
+            .run();
+
+          if (inserted) {
+            closeBlockMathPopup();
+          }
+        },
+        onCancel: () => {
+          currentEditor.commands.focus();
+          closeBlockMathPopup();
+        },
+      },
+      editor: currentEditor,
+    });
+
+    blockMathPopupRef.current = tippy(document.body, {
+      getReferenceClientRect: () =>
+        virtualElement.getBoundingClientRect() as DOMRect,
+      appendTo: () => document.body,
+      content: component.element,
+      showOnCreate: true,
+      interactive: true,
+      trigger: "manual",
+      placement: "bottom-start",
+      offset: [0, 8],
+      onDestroy: () => {
+        component.destroy();
+      },
+    });
+  }, [closeBlockMathPopup, handleEditBlockMath]);
+
   const editor = useEditor({
     extensions: [
       StarterKit.configure({
@@ -691,6 +985,16 @@ export function Editor({
       SlashCommand,
       Wikilink,
       WikilinkSuggestion,
+      ScratchBlockMath.configure({
+        katexOptions: {
+          throwOnError: false,
+          displayMode: true,
+          macros: katexMacros,
+        },
+        onClick: (_node, pos) => {
+          handleEditBlockMath(pos);
+        },
+      }),
     ],
     editorProps: {
       attributes: {
@@ -763,7 +1067,7 @@ export function Editor({
 
         // Check if text looks like markdown (has common markdown patterns)
         const markdownPatterns =
-          /^#{1,6}\s|^\s*[-*+]\s|^\s*\d+\.\s|^\s*>\s|```|^\s*\[.*\]\(.*\)|^\s*!\[|\*\*.*\*\*|__.*__|~~.*~~|^\s*[-*_]{3,}\s*$|^\|.+\|$/m;
+          /^#{1,6}\s|^\s*[-*+]\s|^\s*\d+\.\s|^\s*>\s|```|^\s*\[.*\]\(.*\)|^\s*!\[|\*\*.*\*\*|__.*__|~~.*~~|^\s*[-*_]{3,}\s*$|^\|.+\||\$\$[\s\S]+?\$\$/m;
         if (!markdownPatterns.test(text)) {
           // Not markdown, let TipTap handle it normally
           return false;
@@ -1067,6 +1371,9 @@ export function Editor({
       if (linkPopupRef.current) {
         linkPopupRef.current.destroy();
       }
+      if (blockMathPopupRef.current) {
+        blockMathPopupRef.current.destroy();
+      }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []); // Only run cleanup on unmount, not when saveNote changes
@@ -1074,6 +1381,9 @@ export function Editor({
   // Link handlers - show inline popup at cursor position
   const handleAddLink = useCallback(() => {
     if (!editor) return;
+
+    // Close block math popup if open (popups are mutually exclusive)
+    closeBlockMathPopup();
 
     // Destroy existing popup if any
     if (linkPopupRef.current) {
@@ -1192,7 +1502,7 @@ export function Editor({
         component.destroy();
       },
     });
-  }, [editor]);
+  }, [editor, closeBlockMathPopup]);
 
   // Image handler
   const handleAddImage = useCallback(async () => {
@@ -1234,6 +1544,14 @@ export function Editor({
     window.addEventListener("slash-command-image", handler);
     return () => window.removeEventListener("slash-command-image", handler);
   }, [handleAddImage]);
+
+  // Listen for slash command block math insertion
+  useEffect(() => {
+    const handler = () => handleAddBlockMath();
+    window.addEventListener("slash-command-block-math", handler);
+    return () =>
+      window.removeEventListener("slash-command-block-math", handler);
+  }, [handleAddBlockMath]);
 
   // Keyboard shortcut for Cmd+K to add link (only when editor is focused)
   useEffect(() => {
@@ -1446,6 +1764,21 @@ export function Editor({
   if (!currentNote) {
     // Preview mode: show loading state (content not yet loaded)
     if (previewMode) {
+      return (
+        <div className="flex-1 flex flex-col bg-bg">
+          <div
+            className="h-10 shrink-0 flex items-end px-4 pb-1"
+            data-tauri-drag-region
+          ></div>
+          <div className="flex-1 flex items-center justify-center">
+            <SpinnerIcon className="w-6 h-6 text-text-muted animate-spin" />
+          </div>
+        </div>
+      );
+    }
+
+    // A note is selected but not yet loaded — show loading spinner to avoid empty state flash
+    if (notesCtx?.selectedNoteId) {
       return (
         <div className="flex-1 flex flex-col bg-bg">
           <div
@@ -1683,6 +2016,21 @@ export function Editor({
               </DropdownMenu.Content>
             </DropdownMenu.Portal>
           </DropdownMenu.Root>
+          {onSaveToFolder && (
+            <Tooltip content="Save in Folder">
+              <IconButton
+                onClick={onSaveToFolder}
+                aria-label="Save in Folder"
+                disabled={saveToFolderDisabled}
+              >
+                {saveToFolderDisabled ? (
+                  <SpinnerIcon className="w-4.25 h-4.25 animate-spin" />
+                ) : (
+                  <FolderPlusIcon className="w-4.25 h-4.25 stroke-[1.6]" />
+                )}
+              </IconButton>
+            </Tooltip>
+          )}
         </div>
       </div>
 
@@ -1693,73 +2041,75 @@ export function Editor({
         <FormatBar
           editor={editor}
           onAddLink={handleAddLink}
+          onAddBlockMath={handleAddBlockMath}
           onAddImage={handleAddImage}
         />
       </div>
 
-      {/* Editor content area */}
-      <div
-        ref={scrollContainerRef}
-        className="flex-1 overflow-y-auto overflow-x-hidden relative"
-        dir={textDirection}
-      >
-        {sourceMode ? (
-          /* Markdown source textarea */
-          <div className="h-full">
-            <textarea
-              value={sourceContent}
-              onChange={(e) => handleSourceChange(e.target.value)}
-              dir={textDirection}
-              className="w-full h-full bg-transparent text-text focus:outline-none resize-none px-6 pt-8 pb-24 mx-auto block"
-              style={{
-                maxWidth: "var(--editor-max-width, 48rem)",
-                fontFamily:
-                  "ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Monaco, 'Courier New', monospace",
-                fontSize: "0.875em",
-                lineHeight: "var(--editor-line-height)",
-                tabSize: 2,
-              }}
-              spellCheck={false}
-            />
-          </div>
-        ) : (
-          <>
-            {searchOpen && (
-              <div className="sticky top-2 z-10 animate-in fade-in slide-in-from-top-4 duration-200 pointer-events-none pr-2 flex justify-end">
-                <div className="pointer-events-auto">
-                  <SearchToolbar
-                    inputRef={searchInputRef}
-                    query={searchQuery}
-                    onChange={handleSearchChange}
-                    onNext={goToNextMatch}
-                    onPrevious={goToPreviousMatch}
-                    onClose={() => {
-                      setSearchOpen(false);
-                      setSearchQuery("");
-                      setSearchMatches([]);
-                      setCurrentMatchIndex(0);
-                      // Clear decorations and refocus editor
-                      if (editor) {
-                        updateSearchDecorations([], 0, editor);
-                        editor.commands.focus();
+      {/* Editor content area with resize handles overlay */}
+      <div className="flex-1 relative overflow-hidden">
+        {!focusMode && !sourceMode && (
+          <EditorWidthHandles containerRef={scrollContainerRef} />
+        )}
+        <div
+          ref={scrollContainerRef}
+          className="absolute inset-0 overflow-y-auto overflow-x-hidden"
+          dir={textDirection}
+        >
+          {sourceMode ? (
+            /* Markdown source textarea */
+            <div className="h-full">
+              <textarea
+                value={sourceContent}
+                onChange={(e) => handleSourceChange(e.target.value)}
+                dir={textDirection}
+                className="w-full h-full bg-transparent text-text focus:outline-none resize-none px-6 pt-8 pb-24 mx-auto block"
+                style={{
+                  maxWidth: "var(--editor-max-width, 48rem)",
+                  fontFamily:
+                    "ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Monaco, 'Courier New', monospace",
+                  fontSize: "0.875em",
+                  lineHeight: "var(--editor-line-height)",
+                  tabSize: 2,
+                }}
+                spellCheck={false}
+              />
+            </div>
+          ) : (
+            <>
+              {searchOpen && (
+                <div className="sticky top-2 z-10 animate-in fade-in slide-in-from-top-4 duration-200 pointer-events-none pr-2 flex justify-end">
+                  <div className="pointer-events-auto">
+                    <SearchToolbar
+                      inputRef={searchInputRef}
+                      query={searchQuery}
+                      onChange={handleSearchChange}
+                      onNext={goToNextMatch}
+                      onPrevious={goToPreviousMatch}
+                      onClose={() => {
+                        setSearchOpen(false);
+                        setSearchQuery("");
+                        setSearchMatches([]);
+                        setCurrentMatchIndex(0);
+                        // Clear decorations and refocus editor
+                        if (editor) {
+                          updateSearchDecorations([], 0, editor);
+                          editor.commands.focus();
+                        }
+                      }}
+                      currentMatch={
+                        searchMatches.length === 0 ? 0 : currentMatchIndex + 1
                       }
-                    }}
-                    currentMatch={
-                      searchMatches.length === 0 ? 0 : currentMatchIndex + 1
-                    }
-                    totalMatches={searchMatches.length}
-                  />
+                      totalMatches={searchMatches.length}
+                    />
+                  </div>
                 </div>
-              </div>
-            )}
-            <div
-              className="h-full"
-              onContextMenu={async (e) => {
-                if (!editor?.isActive("table")) return;
+              )}
+              <div
+                className="h-full"
+                onContextMenu={async (e) => {
+                  if (!editor) return;
 
-                e.preventDefault();
-
-                try {
                   // Get the position at the click coordinates
                   const clickPos = editor.view.posAtCoords({
                     left: e.clientX,
@@ -1771,158 +2121,172 @@ export function Editor({
                   // Set the selection to the clicked position
                   editor.chain().focus().setTextSelection(clickPos.pos).run();
 
-                  // Now work with the updated selection
-                  const { state } = editor;
-                  const { selection } = state;
-                  const { $anchor } = selection;
+                  // Check if we're in a table after updating selection
+                  if (!editor.isActive("table")) return;
 
-                  // Find the table cell/header node
-                  let cellDepth = $anchor.depth;
-                  while (
-                    cellDepth > 0 &&
-                    state.doc.resolve($anchor.pos).node(cellDepth).type.name !==
-                      "tableCell" &&
-                    state.doc.resolve($anchor.pos).node(cellDepth).type.name !==
-                      "tableHeader"
-                  ) {
-                    cellDepth--;
-                  }
+                  e.preventDefault();
 
-                  // Guard: if we didn't find a table cell, bail out
-                  if (cellDepth <= 0) return;
+                  try {
+                    // Work with the updated selection
+                    const { state } = editor;
+                    const { selection } = state;
+                    const { $anchor } = selection;
 
-                  const resolvedNode = state.doc
-                    .resolve($anchor.pos)
-                    .node(cellDepth);
-                  if (
-                    resolvedNode.type.name !== "tableCell" &&
-                    resolvedNode.type.name !== "tableHeader"
-                  ) {
-                    return;
-                  }
-
-                  // Get the cell position
-                  const cellPos = $anchor.before(cellDepth);
-
-                  // Check if we're in the first column (index 0 in parent row)
-                  const rowNode = state.doc
-                    .resolve(cellPos)
-                    .node(cellDepth - 1);
-                  let cellIndex = 0;
-                  rowNode.forEach((_node, offset) => {
-                    if (offset < cellPos - $anchor.before(cellDepth - 1) - 1) {
-                      cellIndex++;
-                    }
-                  });
-                  const isFirstColumn = cellIndex === 0;
-
-                  // Check if we're in the first row (index 0 in parent table)
-                  const tableNode = state.doc
-                    .resolve(cellPos)
-                    .node(cellDepth - 2);
-                  let rowIndex = 0;
-                  tableNode.forEach((_node, offset) => {
-                    if (
-                      offset <
-                      $anchor.before(cellDepth - 1) -
-                        $anchor.before(cellDepth - 2) -
-                        1
+                    // Find the table cell/header node
+                    let cellDepth = $anchor.depth;
+                    while (
+                      cellDepth > 0 &&
+                      state.doc.resolve($anchor.pos).node(cellDepth).type
+                        .name !== "tableCell" &&
+                      state.doc.resolve($anchor.pos).node(cellDepth).type
+                        .name !== "tableHeader"
                     ) {
-                      rowIndex++;
+                      cellDepth--;
                     }
-                  });
-                  const isFirstRow = rowIndex === 0;
 
-                  const menuItems = [];
+                    // Guard: if we didn't find a table cell, bail out
+                    if (cellDepth <= 0) return;
 
-                  // Only show "Add Column Before" if not in first column
-                  if (!isFirstColumn) {
+                    const resolvedNode = state.doc
+                      .resolve($anchor.pos)
+                      .node(cellDepth);
+                    if (
+                      resolvedNode.type.name !== "tableCell" &&
+                      resolvedNode.type.name !== "tableHeader"
+                    ) {
+                      return;
+                    }
+
+                    // Get the cell position
+                    const cellPos = $anchor.before(cellDepth);
+
+                    // Check if we're in the first column (index 0 in parent row)
+                    const rowNode = state.doc
+                      .resolve(cellPos)
+                      .node(cellDepth - 1);
+                    let cellIndex = 0;
+                    rowNode.forEach((_node, offset) => {
+                      if (
+                        offset <
+                        cellPos - $anchor.before(cellDepth - 1) - 1
+                      ) {
+                        cellIndex++;
+                      }
+                    });
+                    const isFirstColumn = cellIndex === 0;
+
+                    // Check if we're in the first row (index 0 in parent table)
+                    const tableNode = state.doc
+                      .resolve(cellPos)
+                      .node(cellDepth - 2);
+                    let rowIndex = 0;
+                    tableNode.forEach((_node, offset) => {
+                      if (
+                        offset <
+                        $anchor.before(cellDepth - 1) -
+                          $anchor.before(cellDepth - 2) -
+                          1
+                      ) {
+                        rowIndex++;
+                      }
+                    });
+                    const isFirstRow = rowIndex === 0;
+
+                    const menuItems = [];
+
+                    // Only show "Add Column Before" if not in first column
+                    if (!isFirstColumn) {
+                      menuItems.push(
+                        await MenuItem.new({
+                          text: "Add Column Before",
+                          action: () =>
+                            editor.chain().focus().addColumnBefore().run(),
+                        }),
+                      );
+                    }
                     menuItems.push(
                       await MenuItem.new({
-                        text: "Add Column Before",
+                        text: "Add Column After",
                         action: () =>
-                          editor.chain().focus().addColumnBefore().run(),
+                          editor.chain().focus().addColumnAfter().run(),
                       }),
                     );
-                  }
-                  menuItems.push(
-                    await MenuItem.new({
-                      text: "Add Column After",
-                      action: () =>
-                        editor.chain().focus().addColumnAfter().run(),
-                    }),
-                  );
-                  menuItems.push(
-                    await MenuItem.new({
-                      text: "Delete Column",
-                      action: () => editor.chain().focus().deleteColumn().run(),
-                    }),
-                  );
-                  menuItems.push(
-                    await PredefinedMenuItem.new({ item: "Separator" }),
-                  );
-
-                  // Only show "Add Row Above" if not in first row
-                  if (!isFirstRow) {
                     menuItems.push(
                       await MenuItem.new({
-                        text: "Add Row Above",
+                        text: "Delete Column",
                         action: () =>
-                          editor.chain().focus().addRowBefore().run(),
+                          editor.chain().focus().deleteColumn().run(),
                       }),
                     );
+                    menuItems.push(
+                      await PredefinedMenuItem.new({ item: "Separator" }),
+                    );
+
+                    // Only show "Add Row Above" if not in first row
+                    if (!isFirstRow) {
+                      menuItems.push(
+                        await MenuItem.new({
+                          text: "Add Row Above",
+                          action: () =>
+                            editor.chain().focus().addRowBefore().run(),
+                        }),
+                      );
+                    }
+                    menuItems.push(
+                      await MenuItem.new({
+                        text: "Add Row Below",
+                        action: () =>
+                          editor.chain().focus().addRowAfter().run(),
+                      }),
+                    );
+                    menuItems.push(
+                      await MenuItem.new({
+                        text: "Delete Row",
+                        action: () =>
+                          editor.chain().focus().deleteRow().run(),
+                      }),
+                    );
+                    menuItems.push(
+                      await PredefinedMenuItem.new({ item: "Separator" }),
+                    );
+                    menuItems.push(
+                      await MenuItem.new({
+                        text: "Toggle Header Row",
+                        action: () =>
+                          editor.chain().focus().toggleHeaderRow().run(),
+                      }),
+                    );
+                    menuItems.push(
+                      await MenuItem.new({
+                        text: "Toggle Header Column",
+                        action: () =>
+                          editor.chain().focus().toggleHeaderColumn().run(),
+                      }),
+                    );
+                    menuItems.push(
+                      await PredefinedMenuItem.new({ item: "Separator" }),
+                    );
+                    menuItems.push(
+                      await MenuItem.new({
+                        text: "Delete Table",
+                        action: () =>
+                          editor.chain().focus().deleteTable().run(),
+                      }),
+                    );
+
+                    const menu = await Menu.new({ items: menuItems });
+
+                    await menu.popup();
+                  } catch (err) {
+                    console.error("Table context menu error:", err);
                   }
-                  menuItems.push(
-                    await MenuItem.new({
-                      text: "Add Row Below",
-                      action: () => editor.chain().focus().addRowAfter().run(),
-                    }),
-                  );
-                  menuItems.push(
-                    await MenuItem.new({
-                      text: "Delete Row",
-                      action: () => editor.chain().focus().deleteRow().run(),
-                    }),
-                  );
-                  menuItems.push(
-                    await PredefinedMenuItem.new({ item: "Separator" }),
-                  );
-                  menuItems.push(
-                    await MenuItem.new({
-                      text: "Toggle Header Row",
-                      action: () =>
-                        editor.chain().focus().toggleHeaderRow().run(),
-                    }),
-                  );
-                  menuItems.push(
-                    await MenuItem.new({
-                      text: "Toggle Header Column",
-                      action: () =>
-                        editor.chain().focus().toggleHeaderColumn().run(),
-                    }),
-                  );
-                  menuItems.push(
-                    await PredefinedMenuItem.new({ item: "Separator" }),
-                  );
-                  menuItems.push(
-                    await MenuItem.new({
-                      text: "Delete Table",
-                      action: () => editor.chain().focus().deleteTable().run(),
-                    }),
-                  );
-
-                  const menu = await Menu.new({ items: menuItems });
-
-                  await menu.popup();
-                } catch (err) {
-                  console.error("Table context menu error:", err);
-                }
-              }}
-            >
-              <EditorContent editor={editor} className="h-full text-text" />
-            </div>
-          </>
-        )}
+                }}
+              >
+                <EditorContent editor={editor} className="h-full text-text" />
+              </div>
+            </>
+          )}
+        </div>
       </div>
     </div>
   );

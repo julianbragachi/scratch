@@ -14,6 +14,7 @@ use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl};
 use tauri::webview::WebviewWindowBuilder;
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use tokio::fs;
+use tokio::io::AsyncWriteExt;
 
 mod git;
 
@@ -104,6 +105,8 @@ pub struct Settings {
     pub default_note_name: Option<String>,
     #[serde(rename = "interfaceZoom")]
     pub interface_zoom: Option<f32>,
+    #[serde(rename = "customEditorWidthPx")]
+    pub custom_editor_width_px: Option<u32>,
 }
 
 // Search result
@@ -547,11 +550,14 @@ fn strip_markdown(text: &str) -> String {
     result.trim().to_string()
 }
 
-/// Filter for WalkDir: skips dot-directories (e.g. .scratch, .git) and assets/.
+/// Directories to exclude from note discovery and ID resolution.
+const EXCLUDED_DIRS: &[&str] = &[".git", ".scratch", ".obsidian", ".trash", "assets"];
+
+/// Filter for WalkDir: skips excluded directories.
 fn is_visible_notes_entry(entry: &walkdir::DirEntry) -> bool {
     if entry.file_type().is_dir() {
         let name = entry.file_name().to_str().unwrap_or("");
-        return !name.starts_with('.') && name != "assets";
+        return !EXCLUDED_DIRS.contains(&name);
     }
     true
 }
@@ -561,11 +567,12 @@ fn is_visible_notes_entry(entry: &walkdir::DirEntry) -> bool {
 fn id_from_abs_path(notes_root: &Path, file_path: &Path) -> Option<String> {
     let rel = file_path.strip_prefix(notes_root).ok()?;
 
-    // Skip excluded directories (dot-dirs catch .scratch, .git, etc.)
-    for component in rel.components() {
+    // Skip files inside excluded directories (.git, .scratch, assets, etc.)
+    // Only block specific known dirs so that dot-prefixed *files* like ".foo.md" are still visible.
+    for component in rel.parent().unwrap_or(Path::new("")).components() {
         if let std::path::Component::Normal(name) = component {
             let name_str = name.to_str()?;
-            if name_str.starts_with('.') || name_str == "assets" {
+            if EXCLUDED_DIRS.contains(&name_str) {
                 return None;
             }
         }
@@ -1194,7 +1201,7 @@ fn update_settings(
 async fn write_file(path: String, contents: Vec<u8>) -> Result<(), String> {
     fs::write(&path, contents)
         .await
-        .map_err(|e| format!("Failed to write file: {}", e))
+        .map_err(|_| "Failed to write file".to_string())
 }
 
 #[tauri::command]
@@ -1250,10 +1257,10 @@ async fn read_file_direct(path: String) -> Result<FileContent, String> {
 
     let content = fs::read_to_string(&canonical)
         .await
-        .map_err(|e| format!("Failed to read file: {}", e))?;
+        .map_err(|_| "Failed to read file".to_string())?;
     let metadata = fs::metadata(&canonical)
         .await
-        .map_err(|e| format!("Failed to read metadata: {}", e))?;
+        .map_err(|_| "Failed to read metadata".to_string())?;
 
     let modified = metadata
         .modified()
@@ -1283,11 +1290,11 @@ async fn save_file_direct(path: String, content: String) -> Result<FileContent, 
 
     fs::write(&canonical, &content)
         .await
-        .map_err(|e| format!("Failed to write file: {}", e))?;
+        .map_err(|_| "Failed to write file".to_string())?;
 
     let metadata = fs::metadata(&canonical)
         .await
-        .map_err(|e| format!("Failed to read metadata: {}", e))?;
+        .map_err(|_| "Failed to read metadata".to_string())?;
     let modified = metadata
         .modified()
         .ok()
@@ -1303,6 +1310,114 @@ async fn save_file_direct(path: String, content: String) -> Result<FileContent, 
         title,
         modified,
     })
+}
+
+#[tauri::command]
+async fn import_file_to_folder(
+    app: AppHandle,
+    path: String,
+    state: State<'_, AppState>,
+) -> Result<NoteMetadata, String> {
+    let source = validate_preview_path(&path)?;
+    if !source.is_file() {
+        return Err(format!("Not a file: {}", path));
+    }
+
+    let folder = {
+        let app_config = state.app_config.read().expect("app_config read lock");
+        app_config
+            .notes_folder
+            .clone()
+            .ok_or("Notes folder not set")?
+    };
+    let folder_path = PathBuf::from(&folder);
+
+    // Read the source file content
+    let content = fs::read_to_string(&source)
+        .await
+        .map_err(|_| "Failed to read source file".to_string())?;
+
+    // Derive the note ID from the title (H1 heading), falling back to filename
+    let extracted_title = extract_title(&content);
+    let base_name = if extracted_title.trim().is_empty() {
+        source
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("Untitled")
+            .to_string()
+    } else {
+        extracted_title.trim().to_string()
+    };
+    let base_id = sanitize_filename(&base_name);
+
+    // Atomically create the file and write content via the handle
+    let mut final_id = base_id.clone();
+    let mut counter = 1;
+    loop {
+        let candidate = abs_path_from_id(&folder_path, &final_id)?;
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+            .await
+        {
+            Ok(mut file) => {
+                if file.write_all(content.as_bytes()).await.is_err() {
+                    // Clean up the empty file on write failure
+                    let _ = fs::remove_file(&candidate).await;
+                    return Err("Failed to write file".to_string());
+                }
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                final_id = format!("{}-{}", base_id, counter);
+                counter += 1;
+            }
+            Err(_) => return Err("Failed to create file".to_string()),
+        }
+    };
+
+    let modified = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    // Update search index
+    {
+        let index = state.search_index.lock().expect("search index mutex");
+        if let Some(ref search_index) = *index {
+            let _ = search_index.index_note(&final_id, &extracted_title, &content, modified);
+        }
+    }
+
+    let preview = content
+        .lines()
+        .skip(1)
+        .filter(|l| !l.trim().is_empty())
+        .take(3)
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let metadata = NoteMetadata {
+        id: final_id,
+        title: extracted_title,
+        preview,
+        modified,
+    };
+
+    // Update notes cache so fallback search sees the imported note immediately
+    {
+        let mut cache = state.notes_cache.write().expect("cache write lock");
+        cache.insert(metadata.id.clone(), metadata.clone());
+    }
+
+    // Tell the main window to select the imported note and focus it
+    let _ = app.emit_to("main", "select-note", &metadata.id);
+    if let Some(main_window) = app.get_webview_window("main") {
+        let _ = main_window.set_focus();
+    }
+
+    Ok(metadata)
 }
 
 #[tauri::command]
@@ -1580,7 +1695,7 @@ async fn save_clipboard_image(
     // Decode base64
     let image_data = base64::engine::general_purpose::STANDARD
         .decode(&base64_data)
-        .map_err(|e| format!("Failed to decode base64: {}", e))?;
+        .map_err(|_| "Failed to decode base64 image data".to_string())?;
 
     // Guard against zero-byte files
     if image_data.is_empty() {
@@ -1612,7 +1727,7 @@ async fn save_clipboard_image(
     // Write the file
     fs::write(&target_path, &image_data)
         .await
-        .map_err(|e| format!("Failed to write image: {}", e))?;
+        .map_err(|_| "Failed to write image".to_string())?;
 
     // Return relative path
     Ok(format!("assets/{}", target_name))
@@ -1641,6 +1756,14 @@ async fn copy_image_to_assets(
         .extension()
         .and_then(|e| e.to_str())
         .ok_or("Invalid file extension")?;
+
+    const ALLOWED_IMAGE_EXTENSIONS: &[&str] = &[
+        "jpg", "jpeg", "png", "gif", "webp", "svg", "bmp", "tiff", "tif", "ico", "avif",
+    ];
+    let ext_lower = extension.to_lowercase();
+    if !ALLOWED_IMAGE_EXTENSIONS.contains(&ext_lower.as_str()) {
+        return Err("Only image files can be copied to assets".to_string());
+    }
 
     // Get original filename (without extension)
     let original_name = source
@@ -1671,7 +1794,7 @@ async fn copy_image_to_assets(
     // Copy the file
     fs::copy(&source, &target_path)
         .await
-        .map_err(|e| format!("Failed to copy image: {}", e))?;
+        .map_err(|_| "Failed to copy image".to_string())?;
 
     // Return both relative path and filename for frontend to construct the URL
     Ok(format!("assets/{}", target_name))
@@ -1955,7 +2078,19 @@ async fn git_push_with_upstream(state: State<'_, AppState>) -> Result<git::GitRe
                 // Get current branch first
                 let status = git::get_status(&PathBuf::from(&path));
                 match status.current_branch {
-                    Some(branch) => git::push_with_upstream(&PathBuf::from(&path), &branch),
+                    Some(branch) => {
+                        if !branch
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_' | '.'))
+                        {
+                            return git::GitResult {
+                                success: false,
+                                message: None,
+                                error: Some("Invalid branch name".to_string()),
+                            };
+                        }
+                        git::push_with_upstream(&PathBuf::from(&path), &branch)
+                    }
                     None => git::GitResult {
                         success: false,
                         message: None,
@@ -2019,16 +2154,30 @@ fn get_expanded_path() -> String {
     expanded.join(":")
 }
 
-fn check_cli_exists(command_name: &str, path: &str) -> Result<bool, String> {
-    use std::process::Command;
+/// Create a `Command` that hides the console window on Windows.
+fn no_window_cmd(program: &str) -> std::process::Command {
+    let cmd = std::process::Command::new(program);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        let mut cmd = cmd;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        cmd
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        cmd
+    }
+}
 
+fn check_cli_exists(command_name: &str, path: &str) -> Result<bool, String> {
     let which_cmd = if cfg!(target_os = "windows") {
         "where"
     } else {
         "which"
     };
 
-    let check_output = Command::new(which_cmd)
+    let check_output = no_window_cmd(which_cmd)
         .arg(command_name)
         .env("PATH", path)
         .output()
@@ -2067,7 +2216,7 @@ async fn execute_ai_cli(
     not_found_msg: String,
 ) -> Result<AiExecutionResult, String> {
     use std::io::Write;
-    use std::process::{Child, Command, Stdio};
+    use std::process::{Child, Stdio};
 
     let cli_name = cli_name.to_string();
     let timeout_duration = std::time::Duration::from_secs(300);
@@ -2096,7 +2245,7 @@ async fn execute_ai_cli(
             Ok(true) => {}
         }
 
-        let mut cmd = Command::new(&command);
+        let mut cmd = no_window_cmd(&command);
         cmd.env("PATH", &path);
         for arg in &args {
             cmd.arg(arg);
@@ -2254,12 +2403,35 @@ async fn execute_ai_cli(
 }
 
 #[tauri::command]
-async fn ai_execute_claude(file_path: String, prompt: String) -> Result<AiExecutionResult, String> {
+async fn ai_execute_claude(
+    file_path: String,
+    prompt: String,
+    state: State<'_, AppState>,
+) -> Result<AiExecutionResult, String> {
+    let folder = {
+        let app_config = state.app_config.read().expect("app_config read lock");
+        app_config.notes_folder.clone().ok_or("Notes folder not set")?
+    };
+    let path = PathBuf::from(&file_path);
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    if !ext.eq_ignore_ascii_case("md") && !ext.eq_ignore_ascii_case("markdown") {
+        return Err("AI editing is only supported for markdown files".to_string());
+    }
+    let canonical = path
+        .canonicalize()
+        .map_err(|_| "Invalid file path".to_string())?;
+    let notes_root = PathBuf::from(&folder)
+        .canonicalize()
+        .map_err(|_| "Invalid notes folder".to_string())?;
+    if !canonical.starts_with(&notes_root) {
+        return Err("File must be within notes folder".to_string());
+    }
+
     execute_ai_cli(
         "Claude",
         "claude".to_string(),
         vec![
-            file_path,
+            canonical.to_string_lossy().to_string(),
             "--dangerously-skip-permissions".to_string(),
             "--print".to_string(),
         ],
@@ -2333,6 +2505,7 @@ fn try_select_in_notes_folder(app: &AppHandle, path: &Path) -> bool {
 
     let _ = app.emit_to("main", "select-note", note_id);
     if let Some(main_window) = app.get_webview_window("main") {
+        let _ = main_window.show();
         let _ = main_window.set_focus();
     }
     true
@@ -2414,9 +2587,11 @@ fn open_file_preview(app: AppHandle, path: String) -> Result<(), String> {
     Ok(())
 }
 
-// Handle CLI arguments: open .md files in preview mode
-fn handle_cli_args(app: &AppHandle, args: &[String], cwd: &str) {
+// Handle CLI arguments: open .md files in preview mode.
+// Returns true if a standalone preview window was created (file outside notes folder).
+fn handle_cli_args(app: &AppHandle, args: &[String], cwd: &str) -> bool {
     let mut opened_file = false;
+    let mut opened_preview = false;
 
     for arg in args.iter().skip(1) {
         // Skip flags
@@ -2432,18 +2607,23 @@ fn handle_cli_args(app: &AppHandle, args: &[String], cwd: &str) {
 
         if is_markdown_extension(&path) && path.is_file() {
             opened_file = true;
-            if !try_select_in_notes_folder(app, &path) {
-                let _ = create_preview_window(app, &path.to_string_lossy());
+            if !try_select_in_notes_folder(app, &path)
+                && create_preview_window(app, &path.to_string_lossy()).is_ok()
+            {
+                opened_preview = true;
             }
         }
     }
 
-    // If no files were opened, focus the main window
+    // If no files were opened, show and focus the main window
     if !opened_file {
         if let Some(main_window) = app.get_webview_window("main") {
+            let _ = main_window.show();
             let _ = main_window.set_focus();
         }
     }
+
+    opened_preview
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -2519,14 +2699,42 @@ pub fn run() {
                 let _ = app.asset_protocol_scope().allow_directory(folder, true);
             }
 
-            // Handle CLI args on first launch
+            // Handle CLI args on first launch; determine whether to show the main window.
+            // When a standalone preview is opened (file outside the notes folder) and the
+            // notes folder is already configured, the main window is closed so users only
+            // see the preview. When no notes folder is configured yet, the main window is
+            // always shown so new users can complete onboarding via the FolderPicker.
             let args: Vec<String> = std::env::args().collect();
-            if args.len() > 1 {
+            let opened_preview = if args.len() > 1 {
                 let cwd = std::env::current_dir()
                     .unwrap_or_default()
                     .to_string_lossy()
                     .into_owned();
-                handle_cli_args(app.handle(), &args, &cwd);
+                handle_cli_args(app.handle(), &args, &cwd)
+            } else {
+                false
+            };
+
+            if let Some(main_window) = app.get_webview_window("main") {
+                let has_notes_folder = app
+                    .state::<AppState>()
+                    .app_config
+                    .read()
+                    .expect("app_config read lock")
+                    .notes_folder
+                    .is_some();
+
+                if opened_preview && has_notes_folder {
+                    // Existing user: notes folder is configured and a standalone preview
+                    // was opened. Close the hidden main window so only the preview is visible.
+                    let _ = main_window.hide();
+                } else {
+                    // Show the main window when:
+                    // - No standalone preview was opened (normal launch), OR
+                    // - No notes folder is configured yet (new user needs FolderPicker
+                    //   for onboarding, even if a preview is also showing).
+                    let _ = main_window.show();
+                }
             }
 
             Ok(())
@@ -2581,6 +2789,7 @@ pub fn run() {
             ai_execute_codex,
             read_file_direct,
             save_file_direct,
+            import_file_to_folder,
             open_file_preview,
         ])
         .build(tauri::generate_context!())

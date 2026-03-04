@@ -16,6 +16,7 @@ import {
   CheckSquareIcon,
   QuoteIcon,
   CodeIcon,
+  BlockMathIcon,
   SeparatorIcon,
   ImageIcon,
   TableIcon,
@@ -130,6 +131,16 @@ const SLASH_COMMANDS: SlashCommandItem[] = [
     aliases: ["mermaid", "diagram", "flowchart", "chart"],
     command: (editor) => {
       editor.chain().focus().setCodeBlock({ language: "mermaid" }).run();
+    },
+  },
+  {
+    title: "Block Math",
+    description: "Display math block",
+    icon: <BlockMathIcon />,
+    aliases: ["math", "equation"],
+    command: (editor) => {
+      editor.chain().focus().run();
+      window.dispatchEvent(new CustomEvent("slash-command-block-math"));
     },
   },
   {
