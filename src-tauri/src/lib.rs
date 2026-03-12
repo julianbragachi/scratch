@@ -29,6 +29,7 @@ pub struct NoteMetadata {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CliStatus {
+    pub supported: bool,
     pub installed: bool,
     pub path: Option<String>,
 }
@@ -2209,16 +2210,17 @@ fn cli_target_path() -> PathBuf {
 fn get_cli_status() -> Result<CliStatus, String> {
     #[cfg(not(target_os = "macos"))]
     {
-        return Ok(CliStatus { installed: false, path: None });
+        return Ok(CliStatus { supported: false, installed: false, path: None });
     }
 
     #[cfg(target_os = "macos")]
     {
         let target = cli_target_path();
         if !target.exists() && target.symlink_metadata().is_err() {
-            return Ok(CliStatus { installed: false, path: None });
+            return Ok(CliStatus { supported: true, installed: false, path: None });
         }
         Ok(CliStatus {
+            supported: true,
             installed: true,
             path: Some(target.to_string_lossy().into_owned()),
         })

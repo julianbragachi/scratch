@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 
 export interface CliStatus {
+  supported: boolean;
   installed: boolean;
   path: string | null;
 }

@@ -84,7 +84,7 @@ export function GeneralSettingsSection() {
       .then(setCliStatus)
       .catch((err) => {
         console.error("Failed to get CLI status:", err);
-        setCliStatus({ installed: false, path: null });
+        setCliStatus({ supported: false, installed: false, path: null });
       });
   }, []);
 
@@ -603,10 +603,11 @@ export function GeneralSettingsSection() {
         </div>
       </section>
 
-      {/* Divider */}
+      {/* CLI Tool (macOS only) */}
+      {cliStatus?.supported !== false && (
+      <>
       <div className="border-t border-border border-dashed" />
 
-      {/* CLI Tool */}
       <section className="pb-2">
         <h2 className="text-xl font-medium mb-0.5">CLI Tool</h2>
         <p className="text-sm text-text-muted mb-4">
@@ -679,6 +680,8 @@ export function GeneralSettingsSection() {
           </>
         )}
       </section>
+      </>
+      )}
     </div>
   );
 }
