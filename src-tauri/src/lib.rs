@@ -735,26 +735,15 @@ fn normalize_notes_folder_path(path: &str) -> Result<PathBuf, String> {
     Ok(PathBuf::from(trimmed))
 }
 
-// TAURI COMMANDS
-
-#[tauri::command]
-fn get_notes_folder(state: State<AppState>) -> Option<String> {
-    state
-        .app_config
-        .read()
-        .expect("app_config read lock")
-        .notes_folder
-        .clone()
-}
-
-#[tauri::command]
-fn set_notes_folder(app: AppHandle, path: String, state: State<AppState>) -> Result<(), String> {
-    let path_buf = normalize_notes_folder_path(&path)?;
+/// Shared initialization logic for setting a notes folder.
+/// Creates required directories, verifies write access, updates config/settings,
+/// adds asset protocol scope, and rebuilds the search index.
+fn initialize_notes_folder(app: &AppHandle, path_buf: &PathBuf, state: &AppState) -> Result<String, String> {
     let normalized_path = path_buf.to_string_lossy().into_owned();
 
     // Verify it's a valid directory
     if !path_buf.exists() {
-        std::fs::create_dir_all(&path_buf).map_err(|e| e.to_string())?;
+        std::fs::create_dir_all(path_buf).map_err(|e| e.to_string())?;
     }
 
     // Create assets folder
@@ -789,21 +778,40 @@ fn set_notes_folder(app: AppHandle, path: String, state: State<AppState>) -> Res
     // Save app config to disk
     {
         let app_config = state.app_config.read().expect("app_config read lock");
-        save_app_config(&app, &app_config).map_err(|e| e.to_string())?;
+        save_app_config(app, &app_config).map_err(|e| e.to_string())?;
     }
 
     // Add notes folder to asset protocol scope so images can be served
-    let _ = app.asset_protocol_scope().allow_directory(&path_buf, true);
+    let _ = app.asset_protocol_scope().allow_directory(path_buf, true);
 
     // Initialize search index
-    if let Ok(index_path) = get_search_index_path(&app) {
+    if let Ok(index_path) = get_search_index_path(app) {
         if let Ok(search_index) = SearchIndex::new(&index_path) {
-            let _ = search_index.rebuild_index(&path_buf);
+            let _ = search_index.rebuild_index(path_buf);
             let mut index = state.search_index.lock().expect("search index mutex");
             *index = Some(search_index);
         }
     }
 
+    Ok(normalized_path)
+}
+
+// TAURI COMMANDS
+
+#[tauri::command]
+fn get_notes_folder(state: State<AppState>) -> Option<String> {
+    state
+        .app_config
+        .read()
+        .expect("app_config read lock")
+        .notes_folder
+        .clone()
+}
+
+#[tauri::command]
+fn set_notes_folder(app: AppHandle, path: String, state: State<AppState>) -> Result<(), String> {
+    let path_buf = normalize_notes_folder_path(&path)?;
+    initialize_notes_folder(&app, &path_buf, &state)?;
     Ok(())
 }
 
@@ -2201,11 +2209,19 @@ fn check_cli_exists(command_name: &str, path: &str) -> Result<bool, String> {
 const SCRATCH_CLI_MARKER: &str = "# SCRATCH_CLI_WRAPPER";
 
 /// Returns the path where the CLI script should be installed (macOS only).
+/// Checks PATH for Homebrew bin first, then falls back to architecture detection.
 /// Apple Silicon: /opt/homebrew/bin/scratch
 /// Intel: /usr/local/bin/scratch
 #[cfg(target_os = "macos")]
 fn cli_target_path() -> PathBuf {
-    if PathBuf::from("/opt/homebrew").exists() {
+    // Check if the user's PATH contains /opt/homebrew/bin (Homebrew on Apple Silicon)
+    if let Ok(path_var) = std::env::var("PATH") {
+        if path_var.split(':').any(|p| p == "/opt/homebrew/bin") {
+            return PathBuf::from("/opt/homebrew/bin/scratch");
+        }
+    }
+    // Fall back to architecture detection
+    if std::env::consts::ARCH == "aarch64" {
         return PathBuf::from("/opt/homebrew/bin/scratch");
     }
     PathBuf::from("/usr/local/bin/scratch")
@@ -2906,27 +2922,19 @@ fn handle_cli_args(app: &AppHandle, args: &[String], cwd: &str) -> bool {
                 opened_preview = true;
             }
         } else if path.is_dir() {
-            let path_str = path
-                .canonicalize()
-                .unwrap_or(path.clone())
-                .to_string_lossy()
-                .into_owned();
-            // Persist to config so the frontend init picks it up on cold start
-            // (the event below may be dropped if the frontend hasn't mounted yet)
+            let canonical = path.canonicalize().unwrap_or(path.clone());
             let state = app.state::<AppState>();
-            {
-                let mut config = state.app_config.write().expect("app_config write lock");
-                config.notes_folder = Some(path_str.clone());
-                let _ = save_app_config(app, &config);
+            // Full initialization: directory creation, write-access check,
+            // asset-scope update, config/settings persist, and search-index rebuild
+            match initialize_notes_folder(app, &canonical, &state) {
+                Ok(normalized_path) => {
+                    // Emit event for when app is already running (single-instance)
+                    let _ = app.emit("set-notes-folder", normalized_path);
+                }
+                Err(e) => {
+                    eprintln!("Failed to initialize notes folder {:?}: {}", canonical, e);
+                }
             }
-            // Also reload per-folder settings for the new folder
-            {
-                let new_settings = load_settings(&path_str);
-                let mut settings = state.settings.write().expect("settings write lock");
-                *settings = new_settings;
-            }
-            // Emit event for when app is already running (single-instance)
-            let _ = app.emit("set-notes-folder", path_str);
             if let Some(main_window) = app.get_webview_window("main") {
                 let _ = main_window.show();
                 let _ = main_window.set_focus();
